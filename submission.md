@@ -92,16 +92,99 @@ date/time comparison bug.
    caller's friends within the last `RECENT_THRESHOLD` (24h), orders them
    newest-first, and keeps only the first (most recent) event per friend.
 
-## The Five Issues — Investigation Notes
+## Chosen Bugs & Reproduction (Milestone 2)
 
-I read all five issue descriptions before starting and reproduced each with a
-Python script against the seeded DB (not guesswork) before changing any code.
-Full findings for the bugs I fixed are in the Root Cause Analysis section below.
+I read all five issue descriptions before starting, then reproduced each one
+against a freshly-seeded DB — either through the live HTTP API (`curl`) or by
+calling the service function directly with controlled inputs — before writing
+any fix code. The three I'm fixing (with a stretch goal of a 4th) are **#1, #4,
+and #5**, all reproduced below. I also made a genuine attempt at #2 and #3 and
+could not trigger the reported behavior with the code as written — details in
+their own section at the end, rather than skipped silently.
 
-For **Issue #2** (Friends Listening Now / stale "yesterday" entries) and
-**Issue #3** (duplicate search results), I made a genuine reproduction attempt
-before choosing to focus my three (plus stretch) fixes elsewhere — details below,
-since the brief explicitly says "if you can't reproduce a bug after a genuine
-attempt, try a different one."
+### Issue #1 — Listening streak keeps resetting (Sunday boundary)
 
-*(RCA entries below will be filled in as each bug is fixed.)*
+**How I reproduced it:** I first tried triggering it through the real `/listen`
+endpoint using the server's actual wall-clock time, expecting "today" to be a
+Sunday — but the server's `datetime.now(timezone.utc)` had already rolled over
+to Monday UTC even though it was still Sunday night locally, so that route
+didn't hit the buggy branch. Rather than wait for a real Sunday, I reproduced it
+deterministically the same way the existing (currently failing) test
+`tests/test_streaks.py::test_streak_increments_on_sunday` does: called
+`update_listening_streak()` directly with two explicit, one-day-apart
+timestamps, Saturday 2026-07-04 and Sunday 2026-07-05, on a fresh user with no
+prior streak.
+
+```python
+from services.streak_service import update_listening_streak
+saturday = datetime(2026, 7, 4, 20, 0, 0, tzinfo=timezone.utc)  # weekday()==5
+sunday   = datetime(2026, 7, 5, 20, 0, 0, tzinfo=timezone.utc)  # weekday()==6
+update_listening_streak(nova, saturday)   # streak -> 1
+update_listening_streak(nova, sunday)     # streak stays 1 (bug) instead of -> 2
+```
+
+Result: streak stayed at `1` after the Sunday listen instead of incrementing to
+`2`, even though Sunday is one calendar day after Saturday — a genuine
+consecutive-day streak. Confirmed independently by running
+`pytest tests/test_streaks.py -v`, where `test_streak_increments_on_sunday`
+fails with `assert 1 == 2`.
+
+### Issue #4 — No notification when a friend rates your song
+
+**How I reproduced it:** Seeded fresh data, took a song shared by `nova` and
+rated it as her friend `darius` via the live API, then diffed `nova`'s
+notification list before and after:
+
+```bash
+curl http://127.0.0.1:5050/users/<nova_id>/notifications         # count: 1 (the seeded playlist-add notification)
+curl -X POST http://127.0.0.1:5050/songs/<song_id>/rate \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<darius_id>", "score": 5}'                    # 201, rating created
+curl http://127.0.0.1:5050/users/<nova_id>/notifications         # count: still 1
+```
+
+Result: the rating succeeds (201, `Rating` row created), but `nova`'s
+notification count doesn't change — no `song_rated` notification is ever
+created, confirming the reported behavior.
+
+### Issue #5 — Last song in a playlist never shows up
+
+**How I reproduced it:** Queried the `playlist_entries` association table
+directly for a seeded playlist to get the ground truth, then hit the real API
+for the same playlist and compared counts:
+
+```python
+# ground truth: 7 rows in playlist_entries for this playlist, positions 1-7
+```
+```bash
+curl http://127.0.0.1:5050/playlists/<playlist_id>/songs
+# {"count": 6, "songs": [...]}   <- position 7 ("Golden Hour"'s successor) is missing
+```
+
+Result: the DB has 7 songs in the playlist but the API returns only 6 — the
+song at the highest position (the last one added) is silently dropped every
+time, regardless of playlist size.
+
+### Issues #2 and #3 — attempted but not reproducible here
+
+- **Issue #2 (Friends Listening Now shows people from yesterday):** I checked
+  every friend pair in the seeded data and manually swept the 24-hour cutoff
+  boundary (inserted events at 23h59m and 24h01m old) — `get_friends_listening_now`
+  correctly includes/excludes on both sides of the boundary, and correctly
+  picks each friend's *most recent* event when they have several. I could not
+  construct a case where a >24h-old event leaked into the results.
+- **Issue #3 (duplicate search results):** The `search_songs` query does
+  `outerjoin` against `song_tags` without `.distinct()`, which *does* fan out
+  into duplicate rows at the raw-SQL level for a song with 3+ tags (confirmed
+  by inspecting the compiled SQL and running it directly). But the installed
+  SQLAlchemy version (2.0.51) deduplicates full-entity results by identity in
+  legacy `Query.all()`, so `search_songs("Crown Heights")` — the seed data's
+  own 3-tag song — still returns exactly one result. I could not get a
+  duplicate to actually surface through the service function or the live
+  `/songs/search` endpoint.
+
+Per the brief's own guidance ("if you can't reproduce a bug after a genuine
+attempt, try a different one from the list"), I'm proceeding with #1, #4, #5,
+and will revisit #2/#3 for the stretch goals if time allows.
+
+*(RCA entries below will be filled in as each bug is fixed, per Milestone 3.)*
