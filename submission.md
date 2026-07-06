@@ -1,5 +1,57 @@
 # Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used Claude Code (an AI coding assistant) throughout this project, in the
+codebase-navigation and debugging phases specifically, not just for writing
+the final fix diffs.
+
+**Codebase orientation (Milestone 1):** I had it read every file in `app.py`,
+`models.py`, `routes/`, and `services/` up front and summarize each module's
+responsibility, then trace the two data flows that ended up in the codebase
+map (rating a song, and listening → streak → friends feed). This was genuinely
+useful for getting oriented fast — it correctly noticed the routes-delegate-
+to-services pattern and the UTC-datetime convention on its own, which saved
+time I'd otherwise have spent forming that picture file-by-file.
+
+**Where it helped during debugging:** Once a suspicious line was identified
+(e.g., `today.weekday() != 6` in `streak_service.py`, or `songs[:-1]` in
+`playlist_service.py`), it was useful for quickly confirming factual details I
+could otherwise get wrong from memory — e.g., confirming that Python's
+`datetime.weekday()` maps Monday→0...Sunday→6 (vs. `isoweekday()`'s
+Monday→1...Sunday→7), which mattered for stating the Issue #1 root cause
+precisely rather than just gesturing at "a weekday bug."
+
+**Where I had to verify or override it — this is the important part:**
+- For Issue #1, my first attempt was to reproduce the Sunday bug through the
+  live `/listen` endpoint using the *actual* server clock, on the assumption
+  that "today" was a Sunday. It wasn't a hypothesis error exactly, but an
+  unverified assumption: the server's `datetime.now(timezone.utc)` had already
+  rolled over to Monday UTC while it was still Sunday night in local time. I
+  caught this only by actually printing the weekday computed inside the
+  request instead of trusting the assumed date, and switched to a
+  deterministic repro with explicit timestamps instead — the same technique
+  the pre-existing test suite already used.
+- For Issues #2 and #3, my working hypotheses going in (a naive/aware
+  datetime mismatch breaking the 24-hour feed cutoff; a missing `.distinct()`
+  causing duplicate search rows) were both *plausible from reading the code*
+  but turned out to be **not actually reproducible** once I ran real queries
+  against the seeded data. For #3 specifically, I confirmed with the AI's help
+  that the raw SQL really does fan out into duplicate rows for a multi-tag
+  song — but then verified directly (not by asking the AI, by executing it)
+  that this SQLAlchemy version's `Query.all()` deduplicates full ORM entities
+  by identity before they ever reach `to_dict()`, which is exactly the kind of
+  environment-specific behavior an AI's static reading of the code can't be
+  expected to know. I did not accept "this looks like the bug" as sufficient —
+  in both cases I only wrote up a bug as reproduced after running code and
+  observing the actual output, and documented the two I couldn't reproduce
+  honestly rather than fixing a plausible-but-unverified cause.
+- More generally, I used AI to explain and trace code I had already located
+  myself, and to verify a hypothesis I had already formed by reading the
+  source — not to search for "what's the bug" blind. Every root cause claim
+  below was confirmed by running the actual function with controlled inputs
+  and observing the output, not by taking an explanation at face value.
+
 ## Codebase Map
 
 ### Main files and their roles
@@ -187,4 +239,154 @@ Per the brief's own guidance ("if you can't reproduce a bug after a genuine
 attempt, try a different one from the list"), I'm proceeding with #1, #4, #5,
 and will revisit #2/#3 for the stretch goals if time allows.
 
-*(RCA entries below will be filled in as each bug is fixed, per Milestone 3.)*
+## Root Cause Analyses
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it:** Called `update_listening_streak()` directly (bypassing
+HTTP entirely, since the bug depends on the calendar date rather than any input
+a route accepts) with two explicit UTC timestamps one calendar day apart:
+Saturday 2026-07-04 and Sunday 2026-07-05, on a user with no prior listening
+history. After the Saturday call the streak was `1` as expected. After the
+Sunday call — one consecutive day later — the streak was still `1` instead of
+`2`. I also ran the pre-existing `tests/test_streaks.py::test_streak_increments_on_sunday`,
+which failed with `assert 1 == 2` against the unfixed code, corroborating the
+manual repro.
+
+**How I found the root cause:** Started at `routes/songs.py:listen`, which
+calls `streak_service.record_listening_event()`, which in turn calls
+`update_listening_streak()` — the docstring right above it states the rule
+plainly: "If the user listened yesterday: streak increments by 1." Reading the
+function body line by line, the branch that's supposed to implement that rule is:
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+The `and today.weekday() != 6` clause is what caught my eye — it isn't
+mentioned anywhere in the docstring's stated rules, and there's no comment
+explaining why a week boundary would matter for a *consecutive-day* streak. I
+confirmed the exact index by checking Python's own mapping
+(`datetime(2026, 7, 5).weekday()` → `6`), which matched the Sunday I'd used
+to reproduce the bug — that was the moment I was confident this specific
+comparison, not just "something in the streak logic," was the cause.
+
+**The root cause:** Python's `datetime.weekday()` returns `6` for Sunday
+(Monday is `0`). `update_listening_streak` added `and today.weekday() != 6` to
+the one-day-gap branch, so whenever the *new* listening event's date happens to
+be a Sunday, that condition evaluates to `False` even though `days_since_last
+== 1` is `True`. Control falls through to the `else` clause, which sets
+`listening_streak = 1` — the same behavior used for a genuinely skipped day.
+The visible symptom ("keeps resetting") is exactly this: any user whose streak
+would otherwise continue into a Sunday gets treated as if they'd missed a day,
+every single week.
+
+**Fix and side-effect check:** Removed the `and today.weekday() != 6` clause
+entirely, leaving `elif days_since_last == 1: user.listening_streak += 1`. There
+is no rule anywhere in the spec (docstring or issue) that a week boundary
+should interrupt a consecutive-day streak, so the smallest correct fix is to
+delete the erroneous condition rather than replace it with different weekday
+arithmetic. To check for side effects I ran the full `tests/test_streaks.py`
+suite (all 5 pass now, including the same-day no-op and skipped-day-reset
+cases) and additionally swept all 7 possible weekday transitions
+(Mon→Tue, Tue→Wed, ..., Sun→Mon) plus a "skip a day and land on Sunday" case
+directly against `update_listening_streak` — every consecutive-day transition
+now increments regardless of which day of the week it lands on, and a truly
+skipped day still resets to 1 even when the skip lands on a Sunday, so the
+fix doesn't weaken the reset behavior the bug was conflated with.
+
+### Issue #4 — Notified when a friend adds my song to a playlist, but not when they rate it
+
+**How I reproduced it:** Seeded fresh data, took a song shared by `nova`, and
+recorded her notification count via `GET /users/<nova_id>/notifications`
+(`count: 1`, the seeded playlist-add notification). Then rated that song as her
+friend `darius` via `POST /songs/<song_id>/rate` with `{"user_id": "<darius_id>",
+"score": 5}` — got back a `201` with a valid `Rating` object. Re-checked nova's
+notifications: still `count: 1`. The rating clearly succeeded but produced no
+notification, matching the reported behavior exactly.
+
+**How I found the root cause:** Both `/playlists/<id>/songs` (POST) and
+`/songs/<id>/rate` route to functions in the same file,
+`services/notification_service.py` — `add_to_playlist()` and `rate_song()`. I
+read `add_to_playlist()` first since it's the *working* case: it does its
+write (appending the song to the playlist), commits, and then has an explicit
+block —
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", ...)
+```
+I then read `rate_song()` top to bottom, line by line, expecting to find the
+equivalent block after its `db.session.commit()`. The function instead just
+`return`s the rating immediately after commit — there's no call to
+`create_notification` anywhere in the function, and no other code path in the
+file calls it on `rate_song`'s behalf. That was the moment I was confident:
+this isn't a broken condition or a typo, it's a step that was simply never
+written for this function, even though the module already had every piece
+(`create_notification`, `song.shared_by`, the "skip if actor is the sharer"
+check) needed to add it.
+
+**The root cause:** `rate_song()` and `add_to_playlist()` are structurally
+identical write-paths — both look up the song, perform their write, commit,
+and (per the module's own established pattern) should notify `song.shared_by`
+unless the acting user *is* the sharer. `add_to_playlist()` implements that
+last step; `rate_song()` never had it implemented at all. This is an
+architectural gap, not a logic error — the notification step is simply
+missing from one of the two otherwise-parallel code paths.
+
+**Fix and side-effect check:** Added the same notify-unless-self-sharer call
+used by `add_to_playlist()` to the end of `rate_song()`, right after the
+`db.session.commit()` that saves the rating, using a new `"song_rated"`
+notification type and a body string describing the score given. To check for
+side effects I verified three related scenarios directly against
+`rate_song()`: (1) a friend rating someone else's song produces exactly one
+new notification for the sharer; (2) a user rating **their own** song produces
+no notification (mirroring the existing self-add exemption in
+`add_to_playlist`); (3) updating an already-existing rating (the `existing`
+branch) still fires a notification, matching `add_to_playlist`'s behavior of
+notifying on every successful call rather than only the first. I also reran
+the full test suite — all previously-passing tests (search, streak) stayed
+green, confirming the change is isolated to the rating path.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it:** Seeded fresh data, picked a playlist, and queried the
+`playlist_entries` association table directly to get ground truth:
+7 rows, positions 1–7. Then hit `GET /playlists/<playlist_id>/songs` on the
+same playlist and got back `{"count": 6, ...}` — the song at position 7 (the
+one most recently added) was missing from the response entirely, while
+positions 1–6 were all present and correctly ordered.
+
+**How I found the root cause:** Went straight to `playlist_service.py` since
+it's the only file `get_playlist_songs` (called from `routes/playlists.py:get_songs`)
+lives in. The query itself — join `Song` to `playlist_entries`, filter by
+playlist, order by `position` ascending — builds the exact right list of 7
+songs in the correct order; I confirmed this by printing `len(songs)` right
+after the query, which was `7`. The very next line is
+`return [song.to_dict() for song in songs[:-1]]`. Comparing the query's own
+`len() == 7` against the returned list's `len() == 6` pinpointed the `[:-1]`
+slice as the exact point where a song gets dropped — and the function's own
+docstring, two lines above the query ("This function returns all songs in the
+playlist"), directly contradicts what the code does, which is what made me
+confident this was the root cause rather than a plausible-looking area.
+
+**The root cause:** `get_playlist_songs()` retrieves the fully correct,
+position-ordered list of songs, but its `return` statement slices it with
+`songs[:-1]`, which drops the last element of any non-empty list. Since the
+query already orders by position ascending, "last element" always means the
+song at the highest position — i.e., the most recently added song — so every
+playlist, regardless of size, loses exactly one song: whichever one is last.
+For a playlist with only one song, this slice returns an empty list.
+
+**Fix and side-effect check:** Removed the `[:-1]` slice so the function
+returns `[song.to_dict() for song in songs]` — the full list the query already
+produces correctly. To check the boundary on both ends: I ran the two existing
+tests that assert playlists return all 5 seeded songs in the correct order
+(`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`) —
+both now pass — plus `test_empty_playlist_returns_empty_list`, which still
+passes since an empty list is unaffected by the fix either way. I also
+manually built a single-song playlist and called `get_playlist_songs()`
+directly: before the fix this returned `[]` (the worst case for `[:-1]`, since
+it drops the *only* song), and after the fix it correctly returns that one
+song. Ran the full test suite afterward (13/13 passing) to confirm nothing in
+search or streaks was affected, since this file has no dependency on either.
